@@ -42,7 +42,12 @@ from enum import Enum
 from trusted_senders import load_trusted_data, domain_in_list
 
 # Raise IMAP literal limit so large batch responses aren't truncated
-imaplib._MAXLINE = 4_000_000
+imaplib._MAXLINE = 10_000_000  # Increased for very large mailboxes
+
+# Python 3.9+ also has _MAXDATA which limits response size
+# Set it if available to prevent truncation at ~10000 emails
+if hasattr(imaplib, '_MAXDATA'):
+    imaplib._MAXDATA = 100_000_000  # 100 MB should handle any mailbox size
 
 # ── Optional dependencies ──────────────────────────────────────────────
 try:
