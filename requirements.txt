@@ -1,0 +1,5 @@
+# No external packages required - uses Python standard library only
+# Compatible with Python 3.7+
+
+# Optional: For loading credentials from .env file
+python-dotenv>=1.0.0
