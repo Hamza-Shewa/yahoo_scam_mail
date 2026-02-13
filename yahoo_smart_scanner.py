@@ -39,15 +39,20 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Tuple, Optional
 from enum import Enum
-from trusted_senders import load_trusted_data, domain_in_list
+from scanner_data import load_trusted_data, load_scam_data, domain_in_list
 
 # Raise IMAP literal limit so large batch responses aren't truncated
-imaplib._MAXLINE = 10_000_000  # Increased for very large mailboxes
+# A mailbox with 100K emails, UIDs ~6 digits each = ~700KB response
+imaplib._MAXLINE = 100_000_000  # 100 MB for very large mailboxes
 
 # Python 3.9+ also has _MAXDATA which limits response size
-# Set it if available to prevent truncation at ~10000 emails
+# This is the primary limiter that was capping responses at ~10000 emails
 if hasattr(imaplib, '_MAXDATA'):
-    imaplib._MAXDATA = 100_000_000  # 100 MB should handle any mailbox size
+    imaplib._MAXDATA = 1_000_000_000  # 1 GB - ensures no truncation
+
+# Also increase the literal data limit if it exists
+if hasattr(imaplib, 'Literal') and hasattr(imaplib.Literal, '_MAXDATA'):
+    imaplib.Literal._MAXDATA = 1_000_000_000
 
 # ── Optional dependencies ──────────────────────────────────────────────
 try:
@@ -106,6 +111,15 @@ class ScamSender:
     sample_subjects: List[str]
 
 
+@dataclass
+class BodyAnalysis:
+    """Result of body extraction and structural check."""
+    text: str = ""
+    img_count: int = 0
+    link_count: int = 0
+    is_html: bool = False
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  SmartScanner — the unified engine
 # ════════════════════════════════════════════════════════════════════════
@@ -130,162 +144,21 @@ class SmartScanner:
     BRAND_DOMAINS  = TRUSTED_DATA["brand_domains"]
     BRAND_KEYWORDS = TRUSTED_DATA["brand_keywords"]
 
-    # ── Suspicious / disposable domains ────────────────────────────────
-    SUSPICIOUS_DOMAINS: Set[str] = {
-        # Disposable email services
-        'tempmail.com', 'guerrillamail.com', '10minutemail.com',
-        'mailinator.com', 'yopmail.com', 'fakeinbox.com',
-        'sharklasers.com', 'getairmail.com', 'throwawaymail.com',
-        'trashmail.com', 'dispostable.com', 'maildrop.cc',
-        'guerrillamailblock.com', 'grr.la', 'temp-mail.org',
-        'mohmal.com', 'burnermail.io', 'tempail.com',
-        'emailondeck.com', 'getnada.com', 'tempr.email',
-        'inboxbear.com', 'mailsac.com', 'harakirimail.com',
-        # Suspicious TLDs (start with dot)
-        '.tk', '.ml', '.cf', '.ga', '.gq', '.buzz', '.top',
-        '.xyz', '.click', '.loan', '.work', '.date', '.racing',
-        '.win', '.bid', '.stream', '.review', '.faith',
-        # Classic typosquats
-        'amaz0n.com', 'paypa1.com', 'applle.com', 'micr0soft.com',
-        'g00gle.com', 'faceb00k.com', 'netfl1x.com',
-    }
+    # ── Scam data (loaded from scam_data.json) ────────────────────────
+    SCAM_DATA = load_scam_data()
+    SUSPICIOUS_DOMAINS: Set[str] = set(SCAM_DATA.get("suspicious_domains", []))
+    # Keywords source: prefer canonical "keywords", fall back to
+    # "spam_display_keywords" (current file layout) then "scam_keywords".
+    _raw_keywords = SCAM_DATA.get("keywords")
+    if not _raw_keywords:
+        _raw_keywords = SCAM_DATA.get("spam_display_keywords", SCAM_DATA.get("scam_keywords", []))
+    # Unified keywords list (used for both display-name detection and body scanning)
+    KEYWORDS: List[str] = [k for k in _raw_keywords if k]
+    KEYWORD_SET: Set[str] = set(KEYWORDS)
+    _LOOKALIKES: Dict[str, List[str]] = SCAM_DATA.get("lookalikes", {})
 
-    # ── Spam display-name keywords ─────────────────────────────────────
-    SPAM_DISPLAY_KEYWORDS: Set[str] = {
-        # Health / pharma / weight loss / supplements
-        'male enhancement', 'male-enhancement', 'erectile', 'viagra', 'cialis',
-        'testosterone', 'testosterone therapy', 'sexual wellness', 'libido',
-        'anti-aging', 'anti aging', 'antiaging', 'weight loss', 'weight-loss',
-        'diet pill', 'keto', 'detox', 'cancer flush', 'cancer cure',
-        'cbd gummies', 'cbd oil', 'hemp gummies',
-        'futurhealth', 'futurehealth', 'rex md', 'rexmd',
-        'glp-1', 'glp1', 'wegovy', 'ozempic', 'semaglutide', 'tirzepatide',
-        'medvi', 'trimrx', 'trim rx', 'meds weight loss',
-        'prostate', 'tinnitus', 'silencer', 'heart attack', 'heart - attack',
-        'poop lab', 'poop relief', 'dr. poop', 'clean poop', 'pinch trick',
-        'ed visit', 'ed treatment', 'discreet ed',
-        'oral-b dental', 'dental kit',
-        'particle for', 'eyebags', 'wrinkles',
-        'lifemed', 'lifemd', 'direct meds', 'sarah from direct',
-        'magic mushroom', 'cheech and chong', 'cheech & chong',
-        'focus restore', 'cerebra', 'memory loss',
-        'younger gut', 'flavor infusion', 'pure flavor',
-        'lume deodorant', 'body odor',
-        'noom', 'orangetheory',
-        'sono bello', 'sonobello', 'bello body', 'body contouring',
-        'liposuction', 'laser lipo',
-        'hims', 'hims partner', 'hims |',
-        'gravité', 'gravite', 'gravit',
-        # Financial / debt / lending
-        'loan connection', 'payday loan', 'fast cash', 'easy loan',
-        'credit card bonus', 'creditcardbonus', 'credit score',
-        'debt relief', 'debt consolidation', 'free money',
-        'debt-relief', 'debt free future', 'relief team', 'relief experts',
-        'bitcoin profit', 'crypto profit', 'forex signal',
-        'binary option', 'investment opportunity',
-        'loan approval', 'instant loan', 'loan match', 'personal loan',
-        'bad credit', 'forbadcredit', 'connect to cash',
-        'americor', 'americor financial',
-        'aspirecard', 'aspire card', 'fortivacard', 'fortiva card',
-        'credit limit',
-        'annuities', 'annuity', 'annuities offer', 'annuities info',
-        'reverse mortgage', 'mortgage partner', 'mortgage eligibility',
-        'fha rate', 'home equity', 'point home equity',
-        'roundup claims', 'compensation is waiting', 'compensation awaits',
-        'jgw relief',
-        # Insurance
-        'auto insurance', 'car insurance', 'life insurance',
-        'health insurance', 'aca plan', 'aca plans', 'medicare',
-        'affordable care', 'coverly', 'healthcare.com',
-        'insurance rates', 'insurance quote', 'assurerates', 'assure rates',
-        'provide.auto', 'rate kick',
-        'whole life insurance', 'term life insurance',
-        'assurifii', 'the zebra', 'vehicle protection',
-        'home insurance', 'protection plans',
-        # Fake antivirus / security scams
-        'norton subscription', 'norton security', 'security alert',
-        'security lifecycle', 'mcafee', 'protection disabled',
-        'protection has expired', 'device infected',
-        'final notice', 'payment failed', 'payment_failed',
-        'payment declined', 'payment_declined',
-        'account suspended', 'will be suspended',
-        'action required', 'restore protection',
-        'license has been revoked', 'protection_',
-        'subscription terminated', 'subscription expired',
-        'computer security expired',
-        # Marketing / ad partner
-        'ad partner', 'marketing partner', 'affiliate partner',
-        'blissy ad', 'rad intel', 'special partnership',
-        # Home improvement / services
-        'gutter guard', 'gutter offer', 'gutter savior',
-        'replacement window', 'renewal by andersen', 'renewalbyandersen',
-        'bath remodel', 'remodel expert', 'remodel option', 'jacuzzi bath',
-        'bathroom design', 'shorehome', 'west shore', 'westshorehome',
-        'roofing', 'metal roof', 'innovations partner',
-        'trugreen', 'lawn service', 'local experts',
-        'door-ringer', 'doorbell',
-        'saatva', 'saatva_affiliate',
-        'window project',
-        # Product / deal spam
-        'night vision', 'provision_deal', 'polorvision', 'polar vision',
-        'vision pro discount',
-        'grounded footwear',
-        'warbyparker', 'warby parker',
-        'miracle sheet', 'miracle-sheet',
-        'matsato', 'chef knife', 'kitchen knife', 'chef-quality',
-        'precision kitchen', 'cision kitchen',
-        'derila pillow', 'derila',
-        'heated vest', 'solana gear', 'thermivest', 'thermi vest',
-        'laser away', 'laseraway', 'hair removal',
-        'home shield', 'ahs warranty',
-        'windows partner',
-        'seafood ad', 'usawildseafood', 'wild sea food',
-        'unlimited media', 'flixy', 'flixy rewards',
-        'earncashback', 'earn cash back', 'cash back rewards',
-        'peak wellbeing',
-        'good chop',
-        'big shoes',
-        'education partner',
-        # Casino / gambling
-        'casino', 'free spins', 'wild250',
-        # Fake rewards / surveys / prizes
-        'consumer rewards', 'spices rewards', 'set rewards',
-        'kobalt tool', 'free kobalt',
-        'state farm rewards', 'aaa rewards',
-        "oprah's favorites", 'oprah loves',
-        'sam\'s club partner', 'club partner',
-        'order - shipping',
-        # Firearms / survivalist spam
-        'protect yourself', 'firearm',
-        # Clickbait content farms
-        'nutrition in usa', 'frugal american', 'retired in usa',
-        'psychology diary', 'animal encyclopedia', 'cute animal planet',
-        'mind bending', 'behind closed door', 'hidden gems',
-        'must see places', 'detangle love', 'detangle',
-        'devastating disaster', 'devastating',
-        'door-ringer offer',
-        # Dating / adult
-        'dating.com', 'datemyage', 'date my age',
-        'ukrainian girl', 'ukrainian girls',
-        'connections start', 'singles near', 'find your match',
-        'your match is waiting', 'meet singles',
-        'hot singles', 'adult friend', 'dream soulmate',
-        'someone special', 'eharmony',
-        'shareowner', 'timeshare',
-        # Generic spam
-        'act now', 'limited time', 'exclusive offer', 'congratulations',
-        'you have been selected', 'claim your', 'free gift',
-        'winner', 'prize', 'lottery', 'sweepstake',
-        'nigerian', 'inheritance', 'beneficiary',
-        'work from home', 'make money fast', 'earn extra',
-        'join aarp', 'aarp opportunity', 'aarp membership',
-        'rfk jr', 'liberty mutual',
-        'vision plans', 'vision benefits',
-        'gold ira', 'gold trust', 'investor guide',
-        'emergency kit', 'car emergency',
-    }
     _SPAM_DISPLAY_RE = re.compile(
-        '|'.join(re.escape(kw) for kw in sorted(SPAM_DISPLAY_KEYWORDS, key=len, reverse=True)),
+        '|'.join(re.escape(kw) for kw in sorted(KEYWORD_SET, key=len, reverse=True)) if KEYWORD_SET else r'None\b',
         re.IGNORECASE,
     )
 
@@ -305,44 +178,6 @@ class SmartScanner:
         (re.compile(r'account.*@(?!yahoo|google)', re.I),                     "Generic account@ domain"),
     ]
 
-    # ── Typosquat map ──────────────────────────────────────────────────
-    _LOOKALIKES = {
-        'amazon':    ('amaz0n', 'amazan', 'arnazon', 'amazom'),
-        'paypal':    ('paypa1', 'paypall', 'paypaI', 'payp4l'),
-        'apple':     ('applle', 'aple', 'app1e', 'appie'),
-        'microsoft': ('micr0soft', 'micros0ft', 'rnicrosoft'),
-        'google':    ('g00gle', 'googIe', 'goggle', 'goog1e'),
-        'netflix':   ('netfl1x', 'netfllix', 'netflixx'),
-        'yahoo':     ('yah00', 'yaho0', 'yah0o'),
-    }
-
-    # ── Body content scam analysis (Pass 2) ────────────────────────────
-    SCAM_KEYWORDS = [
-        "wire transfer", "western union", "moneygram", "send money",
-        "inheritance", "next of kin", "deceased", "prince", "barrister",
-        "diplomat", "confidential business", "business proposal",
-        "double your money", "get rich quick",
-        "act immediately", "urgent response needed", "urgent response",
-        "verify account", "suspended", "click link", "click here to verify",
-        "confirm your identity", "update payment", "unusual activity",
-        "unusual login", "suspicious activity",
-        "password expired", "will be deleted", "lose access",
-        "won lottery", "cash prize", "million dollars", "free gift",
-        "cryptocurrency investment", "bitcoin profit", "forex trading",
-        "binary options", "work from home", "earn daily",
-        "no experience needed", "guaranteed income",
-        "health", "pharmacy", "viagra", "cialis", "weight loss", "diet pill",
-        "insurance", "loan approval", "debt relief", "credit card",
-        "bank account details", "credit card details",
-        "social security", "tax refund", "government grant",
-        "ssn", "passport number",
-        "claim your prize", "lottery winner", "you won", "congratulations",
-    ]
-    URGENCY_WORDS = [
-        "urgent", "immediately", "asap", "now", "limited time",
-        "expires", "act now", "expires soon",
-    ]
-
     # Pre-compiled subject patterns
     _SUBJECT_PATTERNS = [
         re.compile(p, re.I) for p in [
@@ -359,6 +194,12 @@ class SmartScanner:
             r"tax.*refund",
         ]
     ]
+
+    URGENCY_WORDS: Set[str] = set(SCAM_DATA.get("urgency_words", [
+        'urgent', 'immediate', 'action required', 'suspended', 'alert',
+        'critical', 'notice', 'final reminder', 'expiry', 'expired',
+        'warning', 'important', 'security alert', 'unauthorized', 'disruption',
+    ]))
 
     # ═══════════════════════════════════════════════════════════════════
     #  Construction / connection
@@ -527,9 +368,11 @@ class SmartScanner:
             m = _EMAIL_EXTRACT_RE.search(addr)
             return m.group(0).lower() if m else None
 
-    def extract_body(self, msg) -> str:
-        """Extract text body (plain preferred, HTML fallback) — capped at 5 000 chars."""
-        body = ""
+    def extract_body(self, msg) -> BodyAnalysis:
+        """Extract text body and analyze structure (image/link counts)."""
+        analysis = BodyAnalysis()
+        body_parts = []
+
         if msg.is_multipart():
             for part in msg.walk():
                 ctype = part.get_content_type()
@@ -538,26 +381,37 @@ class SmartScanner:
                     try:
                         payload = part.get_payload(decode=True)
                         if payload:
-                            body += payload.decode(part.get_content_charset() or 'utf-8', errors='replace')
+                            text = payload.decode(part.get_content_charset() or 'utf-8', errors='replace')
+                            body_parts.append(text)
                     except Exception:
                         pass
-                elif ctype == "text/html" and "attachment" not in disp and not body:
+                elif ctype == "text/html" and "attachment" not in disp:
+                    analysis.is_html = True
                     try:
                         payload = part.get_payload(decode=True)
                         if payload:
                             html = payload.decode(part.get_content_charset() or 'utf-8', errors='replace')
-                            body = re.sub(r'<[^>]+>', ' ', html)
-                            body = re.sub(r'\s+', ' ', body)
+                            # Simple heuristics for counting elements
+                            analysis.img_count += len(re.findall(r'<img\s', html, re.I))
+                            analysis.link_count += len(re.findall(r'<a\s', html, re.I))
+                            
+                            if not body_parts: # Only use HTML text if plain text is missing
+                                text = re.sub(r'<[^>]+>', ' ', html)
+                                text = re.sub(r'\s+', ' ', text)
+                                body_parts.append(text)
                     except Exception:
                         pass
         else:
             try:
                 payload = msg.get_payload(decode=True)
                 if payload:
-                    body = payload.decode(msg.get_content_charset() or 'utf-8', errors='replace')
+                    text = payload.decode(msg.get_content_charset() or 'utf-8', errors='replace')
+                    body_parts.append(text)
             except Exception:
                 pass
-        return body[:5000]
+
+        analysis.text = " ".join(body_parts)[:5000]
+        return analysis
 
     # ── Authentication header parsing ──────────────────────────────────
 
@@ -586,9 +440,9 @@ class SmartScanner:
         """
         reasons: List[str] = []
         auth_issues: List[str] = []
-        email_lower = email_addr.lower()
-        domain = email_addr.rsplit('@', 1)[-1] if '@' in email_addr else ''
-        display_lower = display_name.lower()
+        email_lower = email_addr.strip().lower()
+        domain = email_lower.rsplit('@', 1)[-1] if '@' in email_lower else ''
+        display_lower = display_name.strip().lower()
 
         # Fast-path: trusted
         if email_lower in self.TRUSTED_SENDERS or domain_in_list(domain, self.TRUSTED_DOMAINS):
@@ -652,6 +506,58 @@ class SmartScanner:
 
         return reasons, auth_issues
 
+    def _get_all_uids_chunked(self, folder: str) -> List[bytes]:
+        """
+        Get all UIDs from folder, bypassing Yahoo's 10K response limit.
+        Uses chunked searching with UID ranges.
+        """
+        # Get the UID range
+        status, data = self.mail.uid('SEARCH', None, 'ALL')
+        if status != "OK" or not data[0]:
+            return []
+        
+        initial_uids = data[0].split()
+        if len(initial_uids) < 10000:
+            # Small mailbox, no chunking needed
+            return initial_uids
+        
+        print(f"   ⚠️  Large mailbox detected - using chunked search...")
+        
+        # Yahoo returns first 10K. Get the range.
+        min_uid = int(initial_uids[0])
+        max_uid = int(initial_uids[-1])
+        
+        # Search for the highest UID to find actual max
+        status, data = self.mail.uid('SEARCH', None, f'UID {max_uid}:*')
+        if status == "OK" and data[0]:
+            last_batch = data[0].split()
+            if last_batch:
+                max_uid = int(last_batch[-1])
+        
+        # Now chunk by UID ranges (10K UIDs per chunk)
+        all_uids: List[bytes] = []
+        chunk_size = 10000
+        current_min = min_uid
+        
+        while current_min <= max_uid:
+            current_max = min(current_min + chunk_size - 1, max_uid)
+            status, data = self.mail.uid('SEARCH', None, f'UID {current_min}:{current_max}')
+            if status == "OK" and data[0]:
+                chunk_uids = data[0].split()
+                all_uids.extend(chunk_uids)
+                if chunk_uids:
+                    current_min = int(chunk_uids[-1]) + 1
+                else:
+                    current_min = current_max + 1
+            else:
+                current_min = current_max + 1
+            
+            if self.check_break_key():
+                break
+        
+        print(f"   ✅ Retrieved {len(all_uids)} UIDs total\n")
+        return all_uids
+
     def pass1_sender_filter(self, folder: str, limit: int = 0) -> Dict[str, Dict]:
         """
         PASS 1: Batched header-only sender + auth analysis.
@@ -666,16 +572,23 @@ class SmartScanner:
             print(f"   ⚠️  Could not open folder: {folder}")
             return {}
 
-        status, data = self.mail.uid('SEARCH', None, 'ALL')
-        if status != "OK":
+        # Use chunked UID retrieval to bypass Yahoo's 10K limit
+        all_uids = self._get_all_uids_chunked(folder)
+        if not all_uids:
             return {}
-
-        uids = data[0].split()
+        
+        total_available = len(all_uids)
+        
         if limit > 0:
-            uids = uids[-limit:]
+            uids = all_uids[:limit]  # Scan oldest emails first
+            print(f"   Scanning {len(uids)} of {total_available} emails (oldest first)")
+        else:
+            uids = all_uids
+            print(f"   Scanning all {total_available} emails")
+            
         total = len(uids)
         self.stats['total_checked'] += total
-        print(f"   Total emails: {total}\n")
+        print()
 
         t0 = time.perf_counter()
         suspicious: Dict[str, Dict] = {}
@@ -693,7 +606,7 @@ class SmartScanner:
             try:
                 status, response = self.mail.uid(
                     'FETCH', uid_set,
-                    '(BODY.PEEK[HEADER.FIELDS (FROM AUTHENTICATION-RESULTS RETURN-PATH)])',
+                    '(BODY.PEEK[HEADER.FIELDS (FROM AUTHENTICATION-RESULTS RETURN-PATH SUBJECT)])',
                 )
                 if status != "OK":
                     continue
@@ -711,6 +624,7 @@ class SmartScanner:
                             from_hdr = msg.get('From', '')
                             auth_hdr = msg.get('Authentication-Results', '')
                             return_path = msg.get('Return-Path', '')
+                            subject = msg.get('Subject', '')
 
                             if not from_hdr:
                                 idx += 1
@@ -720,6 +634,16 @@ class SmartScanner:
                             display_name, email_addr = self.extract_email_parts(from_hdr)
                             auth = self.parse_auth_header(auth_hdr)
                             reasons, auth_issues = self._analyze_sender(display_name, email_addr, auth)
+
+                            # Quick subject keyword check (header-only) — flags more suspicious senders
+                            try:
+                                subject_lower = subject.lower()
+                                for kw in self.KEYWORDS:
+                                    if kw in subject_lower:
+                                        reasons.append(f"Scam keyword in subject: '{kw}'")
+                                        break
+                            except Exception:
+                                pass
 
                             # Return-path mismatch
                             if return_path:
@@ -776,11 +700,21 @@ class SmartScanner:
                             continue
                         msg = email.message_from_bytes(md[0][1])
                         from_hdr = msg.get('From', '')
+                        subject = msg.get('Subject', '')
                         if not from_hdr:
                             continue
                         display_name, email_addr = self.extract_email_parts(from_hdr)
                         auth = self.parse_auth_header(msg.get('Authentication-Results', ''))
                         reasons, auth_issues = self._analyze_sender(display_name, email_addr, auth)
+                        # Subject keyword check (fallback path)
+                        try:
+                            subject_lower = subject.lower()
+                            for kw in self.KEYWORDS:
+                                if kw in subject_lower:
+                                    reasons.append(f"Scam keyword in subject: '{kw}'")
+                                    break
+                        except Exception:
+                            pass
                         if reasons or auth_issues:
                             self.stats['sender_filtered'] += 1
                             if email_addr not in suspicious:
@@ -858,12 +792,28 @@ class SmartScanner:
                 display_name, email_addr = self.extract_email_parts(from_hdr)
 
                 sender_data = suspicious.get(email_addr, {'reasons': [], 'auth_issues': []})
-                body = self.extract_body(msg)
+                analysis = self.extract_body(msg)
+                body = analysis.text
                 body_lower = body.lower()
                 subject_lower = subject.lower()
 
                 content_reasons: List[str] = []
                 score = len(sender_data.get('reasons', [])) * 10 + 20  # base from pass 1
+
+                # Heuristic: Image-heavy, text-light (common for bypassing filters)
+                words = body_lower.split()
+                if analysis.is_html:
+                    if analysis.img_count >= 1 and len(words) < 40:
+                        content_reasons.append("Image-heavy / Low-text pattern")
+                        score += 35
+                    elif analysis.img_count >= 3:
+                        content_reasons.append(f"High image count ({analysis.img_count})")
+                        score += 15
+                
+                # Tiny text detection (often used to hide keywords or links)
+                if len(body.strip()) > 0 and len(body.strip()) < 100:
+                    content_reasons.append("Suspiciously short body text")
+                    score += 10
 
                 # Subject patterns
                 for pat in self._SUBJECT_PATTERNS:
@@ -871,9 +821,9 @@ class SmartScanner:
                         content_reasons.append(f"Suspicious subject: '{pat.pattern[:30]}…'")
                         score += 15
 
-                # Body scam keywords
+                # Body scam keywords (use unified keyword set)
                 kw_count = 0
-                for kw in self.SCAM_KEYWORDS:
+                for kw in self.KEYWORDS:
                     if kw in body_lower:
                         kw_count += 1
                         if kw_count <= 3:
